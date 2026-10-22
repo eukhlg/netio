@@ -2,6 +2,7 @@ package udptransport
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,10 +32,13 @@ func listen(t testing.TB, network string) *net.UDPConn {
 	return c
 }
 func TestLoopbackMessages(t *testing.T) {
-	for _, size := range []int{1, 8, 32} {
+	for _, size := range []int{1, 32, 128} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
 			a, b, s := listen(t, "udp4"), listen(t, "udp4"), listen(t, "udp4")
-			tx := New(s)
+			tx, err := NewWithBatchSize(s, size)
+			if err != nil {
+				t.Fatal(err)
+			}
 			messages := make([]Message, size)
 			for i := range messages {
 				peer := a.LocalAddr()
@@ -51,8 +55,11 @@ func TestLoopbackMessages(t *testing.T) {
 				start += n
 			}
 			for parity, c := range []*net.UDPConn{a, b} {
-				rx := New(c)
-				slots := make([]Message, BatchSize)
+				rx, err := NewWithBatchSize(c, size)
+				if err != nil {
+					t.Fatal(err)
+				}
+				slots := make([]Message, size)
 				for i := range slots {
 					slots[i].Payload = make([]byte, 100)
 				}
@@ -281,5 +288,41 @@ func TestDeadlineAndNegativeErrorCount(t *testing.T) {
 	n, err = conn.Write([]Message{{Payload: []byte{1}}})
 	if n != 0 || !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("write error lost: %d %v", n, err)
+	}
+}
+
+func TestBatchSizeValidation(t *testing.T) {
+	for _, size := range []int{-1, 0, 257} {
+		if _, err := NewWithBatchSize(nil, size); err == nil {
+			t.Fatalf("accepted %d", size)
+		}
+		if _, err := NewSender(context.Background(), newSenderSocket(), 1, size); err == nil {
+			t.Fatalf("sender accepted %d", size)
+		}
+	}
+	for _, size := range []int{1, 32, 128, 256} {
+		c, err := NewWithBatchSize(nil, size)
+		if err != nil || len(c.rx) != size || len(c.tx) != size {
+			t.Fatalf("%d: %v", size, err)
+		}
+	}
+}
+
+// The scripted syscall boundary isolates metadata overhead from scheduling and
+// kernel allocations. Construction is excluded from the timed region.
+func BenchmarkBatchMetadata(b *testing.B) {
+	for _, size := range []int{1, 32, 128} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			c, _ := NewWithBatchSize(nil, size)
+			c.batch = scriptedBatch{writes: func(m []ipv6.Message) (int, error) { return len(m), nil }}
+			messages := make([]Message, size)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := c.Write(messages); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

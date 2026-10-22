@@ -3,6 +3,7 @@ package udptransport
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -11,8 +12,20 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// BatchSize bounds both queue draining and receive storage.
-const BatchSize = 32
+// DefaultBatchSize bounds queue draining and receive storage unless configured.
+const DefaultBatchSize = 32
+
+// BatchSize is retained for source compatibility. New code should use
+// DefaultBatchSize or the size selected at construction.
+const BatchSize = DefaultBatchSize
+
+// ValidateBatchSize accepts bounded batches without changing packet ordering.
+func ValidateBatchSize(size int) error {
+	if size < 1 || size > 256 {
+		return fmt.Errorf("udp batch size must be between 1 and 256: %d", size)
+	}
+	return nil
+}
 
 // Message borrows caller-owned storage until the operation returns. N and
 // Truncated are receive outputs. Each message is one UDP datagram.
@@ -34,23 +47,32 @@ type Conn struct {
 	conn                        net.PacketConn
 	batch                       batchSocket
 	readFallback, writeFallback atomic.Bool
-	rx, tx                      [BatchSize]ipv6.Message
-	rxBuffers, txBuffers        [BatchSize][1][]byte
+	rx, tx                      []ipv6.Message
+	rxBuffers, txBuffers        [][1][]byte
 }
 
 func New(conn net.PacketConn) *Conn {
-	c := &Conn{conn: conn, batch: newBatchSocket(conn)}
+	c, _ := NewWithBatchSize(conn, DefaultBatchSize)
+	return c
+}
+
+// NewWithBatchSize allocates all message metadata once, before I/O starts.
+func NewWithBatchSize(conn net.PacketConn, size int) (*Conn, error) {
+	if err := ValidateBatchSize(size); err != nil {
+		return nil, err
+	}
+	c := &Conn{conn: conn, batch: newBatchSocket(conn), rx: make([]ipv6.Message, size), tx: make([]ipv6.Message, size), rxBuffers: make([][1][]byte, size), txBuffers: make([][1][]byte, size)}
 	for i := range c.rx {
 		c.rx[i].Buffers = c.rxBuffers[i][:]
 		c.tx[i].Buffers = c.txBuffers[i][:]
 	}
-	return c
+	return c, nil
 }
 func (c *Conn) BatchSize() int {
 	if c.batch == nil {
 		return 1
 	}
-	return BatchSize
+	return len(c.rx)
 }
 func unsupported(err error) bool {
 	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP)
@@ -63,8 +85,8 @@ func (c *Conn) Read(messages []Message) (int, error) {
 	if len(messages) == 0 {
 		return 0, nil
 	}
-	if len(messages) > BatchSize {
-		messages = messages[:BatchSize]
+	if len(messages) > len(c.rx) {
+		messages = messages[:len(c.rx)]
 	}
 	if c.batch != nil && !c.readFallback.Load() {
 		for i := range messages {
@@ -127,8 +149,8 @@ func (c *Conn) Write(messages []Message) (int, error) {
 	if len(messages) == 0 {
 		return 0, nil
 	}
-	if len(messages) > BatchSize {
-		messages = messages[:BatchSize]
+	if len(messages) > len(c.rx) {
+		messages = messages[:len(c.rx)]
 	}
 	if c.batch != nil && !c.writeFallback.Load() {
 		for i, m := range messages {
