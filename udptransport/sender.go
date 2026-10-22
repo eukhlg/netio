@@ -49,20 +49,38 @@ type Sender struct {
 	stopped, watcherStopped chan struct{}
 	mu                      sync.Mutex
 	err                     error
+	batch                   []queuedDatagram
+	messages                []Message
+	indices                 []int
 }
 
-func NewSender(ctx context.Context, conn net.PacketConn, capacity int) (*Sender, error) {
-	return NewSenderWithWriter(ctx, conn, New(conn), capacity)
+func NewSender(ctx context.Context, conn net.PacketConn, capacity int, batchSize ...int) (*Sender, error) {
+	size, err := senderBatchSize(batchSize)
+	if err != nil {
+		return nil, err
+	}
+	udp, err := NewWithBatchSize(conn, size)
+	if err != nil {
+		return nil, err
+	}
+	return NewSenderWithWriter(ctx, conn, udp, capacity, size)
 }
 
 // NewSenderWithWriter supports injected batch writers using the same ownership
 // and partial-write contract as Conn. It still owns and closes conn.
-func NewSenderWithWriter(ctx context.Context, conn net.PacketConn, writer Writer, capacity int) (*Sender, error) {
+func NewSenderWithWriter(ctx context.Context, conn net.PacketConn, writer Writer, capacity int, batchSize ...int) (*Sender, error) {
+	size, err := senderBatchSize(batchSize)
+	if err != nil {
+		return nil, err
+	}
 	if conn == nil || writer == nil || capacity < 1 {
 		return nil, errors.New("udp sender: connection, writer and positive capacity required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Sender{conn: conn, writer: writer, ctx: ctx, cancel: cancel, queue: make(chan queuedDatagram, capacity), submit: make(chan struct{}, 1), stopped: make(chan struct{}), watcherStopped: make(chan struct{})}
+	s.batch = make([]queuedDatagram, size)
+	s.messages = make([]Message, size)
+	s.indices = make([]int, size)
 	s.submit <- struct{}{}
 	go func() { defer close(s.watcherStopped); <-ctx.Done(); _ = conn.Close() }()
 	go s.run()
@@ -145,9 +163,7 @@ func (s *Sender) run() {
 		s.submit <- struct{}{}
 		close(s.stopped)
 	}()
-	var batch [BatchSize]queuedDatagram
-	var messages [BatchSize]Message
-	var indices [BatchSize]int
+	batch, messages, indices := s.batch, s.messages, s.indices
 	for {
 		n := 0
 		select {
@@ -230,4 +246,16 @@ func (s *Sender) run() {
 			return
 		}
 	}
+}
+
+// An omitted size preserves the original constructor behavior.
+func senderBatchSize(sizes []int) (int, error) {
+	size := DefaultBatchSize
+	if len(sizes) > 1 {
+		return 0, errors.New("udp sender: at most one batch size required")
+	}
+	if len(sizes) == 1 {
+		size = sizes[0]
+	}
+	return size, ValidateBatchSize(size)
 }
