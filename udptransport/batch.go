@@ -44,15 +44,20 @@ type batchSocket interface {
 // Conn leaves deadlines and socket ownership with its caller. One reader and
 // one writer may operate concurrently. Metadata is kept independently per side.
 type Conn struct {
-	conn                        net.PacketConn
-	batch                       batchSocket
-	readFallback, writeFallback atomic.Bool
-	rx, tx                      []ipv6.Message
-	rxBuffers, txBuffers        [][1][]byte
-	gso                         atomic.Bool
-	txVectors                   [][]byte
-	txEnds                      []int
-	txOOB                       [][]byte
+	conn                          net.PacketConn
+	batch                         batchSocket
+	readFallback, writeFallback   atomic.Bool
+	rx, tx                        []ipv6.Message
+	rxBuffers, txBuffers          [][1][]byte
+	gso                           atomic.Bool
+	txVectors                     [][]byte
+	txEnds                        []int
+	txOOB                         [][]byte
+	gro                           bool
+	groBuffers                    [][]byte
+	groOOB                        [][]byte
+	groCount, groIndex, groOffset int
+	groErr                        error
 }
 
 func New(conn net.PacketConn) *Conn {
@@ -60,16 +65,22 @@ func New(conn net.PacketConn) *Conn {
 	return c
 }
 
-// NewWithBatchSize allocates all message metadata once, before I/O starts.
+// Options controls optional kernel UDP offloads. Zero values enable send GSO
+// when supported and leave receive GRO disabled.
 type Options struct {
 	// DisableGSO preserves ordinary datagram sends even when the kernel supports GSO.
 	DisableGSO bool
+	// EnableGRO opts into Linux receive coalescing. Unsupported kernels keep normal reads.
+	EnableGRO bool
 }
 
+// NewWithBatchSize allocates all message metadata once, before I/O starts.
 func NewWithBatchSize(conn net.PacketConn, size int) (*Conn, error) {
 	return NewWithOptions(conn, size, Options{})
 }
 
+// NewWithOptions probes offload support and allocates connection storage.
+// Unsupported offloads leave ordinary datagram I/O available.
 func NewWithOptions(conn net.PacketConn, size int, options Options) (*Conn, error) {
 	if err := ValidateBatchSize(size); err != nil {
 		return nil, err
@@ -86,11 +97,23 @@ func NewWithOptions(conn net.PacketConn, size int, options Options) (*Conn, erro
 		c.txOOB[i] = make([]byte, segmentControlSize())
 	}
 	c.gso.Store(!options.DisableGSO && probeGSO(conn))
+	c.gro = options.EnableGRO && enableGRO(conn)
+	if c.gro {
+		c.groBuffers = make([][]byte, size)
+		c.groOOB = make([][]byte, size)
+		for i := range c.rx {
+			c.groBuffers[i] = make([]byte, 65535)
+			c.groOOB[i] = make([]byte, 128)
+		}
+	}
 	return c, nil
 }
 
 // GSOEnabled reports probed support; a runtime failure disables it for this Conn.
 func (c *Conn) GSOEnabled() bool { return c.gso.Load() }
+
+// GROEnabled reports whether this connection enabled kernel receive coalescing.
+func (c *Conn) GROEnabled() bool { return c.gro }
 func (c *Conn) BatchSize() int {
 	if c.batch == nil {
 		return 1
@@ -110,6 +133,9 @@ func (c *Conn) Read(messages []Message) (int, error) {
 	}
 	if len(messages) > len(c.rx) {
 		messages = messages[:len(c.rx)]
+	}
+	if c.gro {
+		return c.readGRO(messages)
 	}
 	if c.batch != nil && !c.readFallback.Load() {
 		for i := range messages {
