@@ -44,11 +44,20 @@ type batchSocket interface {
 // Conn leaves deadlines and socket ownership with its caller. One reader and
 // one writer may operate concurrently. Metadata is kept independently per side.
 type Conn struct {
-	conn                        net.PacketConn
-	batch                       batchSocket
-	readFallback, writeFallback atomic.Bool
-	rx, tx                      []ipv6.Message
-	rxBuffers, txBuffers        [][1][]byte
+	conn                          net.PacketConn
+	batch                         batchSocket
+	readFallback, writeFallback   atomic.Bool
+	rx, tx                        []ipv6.Message
+	rxBuffers, txBuffers          [][1][]byte
+	gso                           atomic.Bool
+	txVectors                     [][]byte
+	txEnds                        []int
+	txOOB                         [][]byte
+	gro                           bool
+	groBuffers                    [][]byte
+	groOOB                        [][]byte
+	groCount, groIndex, groOffset int
+	groErr                        error
 }
 
 func New(conn net.PacketConn) *Conn {
@@ -56,8 +65,23 @@ func New(conn net.PacketConn) *Conn {
 	return c
 }
 
+// Options controls optional kernel UDP offloads. Zero values enable send GSO
+// when supported and leave receive GRO disabled.
+type Options struct {
+	// DisableGSO preserves ordinary datagram sends even when the kernel supports GSO.
+	DisableGSO bool
+	// EnableGRO opts into Linux receive coalescing. Unsupported kernels keep normal reads.
+	EnableGRO bool
+}
+
 // NewWithBatchSize allocates all message metadata once, before I/O starts.
 func NewWithBatchSize(conn net.PacketConn, size int) (*Conn, error) {
+	return NewWithOptions(conn, size, Options{})
+}
+
+// NewWithOptions probes offload support and allocates connection storage.
+// Unsupported offloads leave ordinary datagram I/O available.
+func NewWithOptions(conn net.PacketConn, size int, options Options) (*Conn, error) {
 	if err := ValidateBatchSize(size); err != nil {
 		return nil, err
 	}
@@ -66,8 +90,30 @@ func NewWithBatchSize(conn net.PacketConn, size int) (*Conn, error) {
 		c.rx[i].Buffers = c.rxBuffers[i][:]
 		c.tx[i].Buffers = c.txBuffers[i][:]
 	}
+	c.txVectors = make([][]byte, size)
+	c.txEnds = make([]int, size)
+	c.txOOB = make([][]byte, size)
+	for i := range c.txOOB {
+		c.txOOB[i] = make([]byte, segmentControlSize())
+	}
+	c.gso.Store(!options.DisableGSO && probeGSO(conn))
+	c.gro = options.EnableGRO && enableGRO(conn)
+	if c.gro {
+		c.groBuffers = make([][]byte, size)
+		c.groOOB = make([][]byte, size)
+		for i := range c.rx {
+			c.groBuffers[i] = make([]byte, 65535)
+			c.groOOB[i] = make([]byte, 128)
+		}
+	}
 	return c, nil
 }
+
+// GSOEnabled reports probed support; a runtime failure disables it for this Conn.
+func (c *Conn) GSOEnabled() bool { return c.gso.Load() }
+
+// GROEnabled reports whether this connection enabled kernel receive coalescing.
+func (c *Conn) GROEnabled() bool { return c.gro }
 func (c *Conn) BatchSize() int {
 	if c.batch == nil {
 		return 1
@@ -87,6 +133,9 @@ func (c *Conn) Read(messages []Message) (int, error) {
 	}
 	if len(messages) > len(c.rx) {
 		messages = messages[:len(c.rx)]
+	}
+	if c.gro {
+		return c.readGRO(messages)
 	}
 	if c.batch != nil && !c.readFallback.Load() {
 		for i := range messages {
@@ -153,15 +202,27 @@ func (c *Conn) Write(messages []Message) (int, error) {
 		messages = messages[:len(c.rx)]
 	}
 	if c.batch != nil && !c.writeFallback.Load() {
-		for i, m := range messages {
-			c.tx[i].Buffers[0] = m.Payload
-			c.tx[i].Addr = m.Peer
+		count, hasGSO := c.prepareWrites(messages)
+		n, err := c.batch.WriteBatch(c.tx[:count], 0)
+		if n < 0 && err != nil {
+			n = 0
 		}
-		n, err := c.batch.WriteBatch(c.tx[:len(messages)], 0)
-		for i := range messages {
-			c.tx[i].Buffers[0] = nil
-			c.tx[i].Addr = nil
+		if n < 0 || n > count {
+			c.clearWrites(count)
+			return 0, io.ErrShortWrite
 		}
+		sent := 0
+		if n > 0 {
+			sent = c.txEnds[n-1]
+		}
+		c.clearWrites(count)
+		if hasGSO && gsoUnsupported(err) {
+			c.gso.Store(false)
+			// sendmmsg reports only its successful prefix. Never retransmit it.
+			more, retryErr := c.Write(messages[sent:])
+			return sent + more, retryErr
+		}
+		n = sent
 		if n < 0 && err != nil {
 			n = 0
 		}
@@ -185,4 +246,54 @@ func (c *Conn) Write(messages []Message) (int, error) {
 		return 0, io.ErrShortWrite
 	}
 	return 1, nil
+}
+
+func samePeer(a, b net.Addr) bool {
+	x, ok := a.(*net.UDPAddr)
+	y, yes := b.(*net.UDPAddr)
+	return ok && yes && x != nil && y != nil && x.Port == y.Port && x.Zone == y.Zone && x.IP.Equal(y.IP)
+}
+
+func (c *Conn) prepareWrites(messages []Message) (int, bool) {
+	count, used := 0, false
+	for start := 0; start < len(messages); {
+		end, size, total := start+1, len(messages[start].Payload), len(messages[start].Payload)
+		if c.gso.Load() && size > 0 && size <= maxGSOPayload {
+			for end < len(messages) && end-start < maxGSOSegments {
+				next := messages[end]
+				if !samePeer(messages[start].Peer, next.Peer) || len(next.Payload) == 0 || len(next.Payload) > size || total+len(next.Payload) > maxGSOPayload {
+					break
+				}
+				total += len(next.Payload)
+				end++
+				if len(next.Payload) < size {
+					break
+				}
+			}
+		}
+		for i := start; i < end; i++ {
+			c.txVectors[i] = messages[i].Payload
+		}
+		c.tx[count].Buffers = c.txVectors[start:end]
+		c.tx[count].Addr = messages[start].Peer
+		c.tx[count].OOB = nil
+		if end-start > 1 {
+			c.tx[count].OOB = segmentControl(c.txOOB[count], size)
+			used = true
+		}
+		c.txEnds[count] = end
+		count++
+		start = end
+	}
+	return count, used
+}
+func (c *Conn) clearWrites(count int) {
+	for i := 0; i < count; i++ {
+		c.tx[i].Buffers = nil
+		c.tx[i].Addr = nil
+		c.tx[i].OOB = nil
+	}
+	for i := range c.txVectors {
+		c.txVectors[i] = nil
+	}
 }
