@@ -82,3 +82,30 @@ func TestDoubleReleasePanics(t *testing.T) {
 	}()
 	b.Release()
 }
+
+func TestBytesWithTailroomDoesNotDirtyTail(t *testing.T) {
+	b, err := Acquire(1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := b.BytesWithTailroom()
+	if len(view) != 1400 || cap(view) != 1400+b.Tailroom() {
+		t.Fatalf("len=%d cap=%d tailroom=%d", len(view), cap(view), b.Tailroom())
+	}
+	if b.dirtyStart != Headroom || b.dirtyEnd != Headroom+1400 {
+		t.Fatalf("dirty=[%d,%d), want [%d,%d)", b.dirtyStart, b.dirtyEnd, Headroom, Headroom+1400)
+	}
+	// A writer that grows the view must zero what it wrote before Release.
+	grown := append(view, 1, 2, 3)
+	if &grown[0] != &view[0] {
+		t.Fatal("growth reallocated")
+	}
+	clear(grown[len(view):])
+	storage := b.storage
+	b.Release()
+	for i, v := range storage {
+		if v != 0 {
+			t.Fatalf("byte %d not zero after release", i)
+		}
+	}
+}
