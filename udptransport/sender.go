@@ -17,11 +17,21 @@ type Releaser interface{ Release() }
 
 // Datagram borrows Payload from Owner. Successful Enqueue transfers ownership;
 // on failure the caller still owns it. Eligible is rechecked before each write.
+//
+// Ownership contract, shared by Sender and ShardedSender: every accepted
+// datagram's Owner is released exactly once, by the sender goroutine that
+// accepted it, after its write completes, after it is skipped as ineligible,
+// or when the sender stops with it still queued. A rejected Enqueue never
+// releases. No other goroutine touches an accepted Payload, so Payload storage
+// may be reused as soon as Release runs.
 type Datagram struct {
 	Payload  []byte
 	Peer     net.Addr
 	Owner    Releaser
 	Eligible func() bool
+	// Flow selects the shard of a ShardedSender (a flowhash value). Datagrams
+	// with equal Flow keep their order; Sender ignores it.
+	Flow uint32
 }
 
 func (d Datagram) release() {
