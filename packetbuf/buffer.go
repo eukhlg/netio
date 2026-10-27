@@ -59,6 +59,17 @@ func (b *Buffer) Bytes() []byte {
 	return b.storage[b.start:b.end:b.end]
 }
 
+// BytesWithTailroom returns the valid bytes with capacity extending to the end
+// of storage, for writers that may grow the view in place (for example TUN GRO
+// coalescing). Only the valid bytes are recorded as written. A writer that
+// stores bytes beyond the returned length must zero them before the next
+// mutation, ownership transfer or Release: Release relies on unexposed storage
+// already being zero, so the tail is never pre-marked dirty.
+func (b *Buffer) BytesWithTailroom() []byte {
+	b.expose(b.start, b.end)
+	return b.storage[b.start:b.end:len(b.storage)]
+}
+
 // expose records a conservative union: trimming a view never makes bytes clean.
 func (b *Buffer) expose(start, end int) {
 	if start == end {
