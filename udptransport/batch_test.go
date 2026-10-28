@@ -125,6 +125,7 @@ func TestPartialProgressAndZero(t *testing.T) {
 }
 func TestReadValidPrefixAndLengths(t *testing.T) {
 	c := New(listen(t, "udp4"))
+	c.recv = nil // script the x/net path
 	c.batch = scriptedBatch{reads: func(m []ipv6.Message) (int, error) { m[0].N = 3; m[1].N = 9; return 2, io.EOF }}
 	slots := []Message{{Payload: make([]byte, 4)}, {Payload: make([]byte, 4)}, {Payload: make([]byte, 4), N: 99}}
 	n, err := c.Read(slots)
@@ -141,7 +142,7 @@ func BenchmarkUDPTransport(b *testing.B) {
 				reader := New(rx)
 				if !batch {
 					writer.batch = nil
-					reader.batch = nil
+					reader.batch, reader.recv = nil, nil
 				}
 				stop := make(chan struct{})
 				done := make(chan struct{})
@@ -213,6 +214,7 @@ func TestUnsupportedBatchFallsBackOnce(t *testing.T) {
 		t.Fatal(calls)
 	}
 	reader := New(rx)
+	reader.recv = nil // script the x/net path
 	calls = 0
 	reader.batch = scriptedBatch{reads: func([]ipv6.Message) (int, error) { calls++; return 0, syscall.EOPNOTSUPP }}
 	for i := 0; i < 2; i++ {
@@ -278,6 +280,7 @@ func TestDeadlineAndNegativeErrorCount(t *testing.T) {
 	if n != 0 || !errors.As(err, &ne) || !ne.Timeout() {
 		t.Fatalf("deadline lost: %d %v", n, err)
 	}
+	conn.recv = nil // script the x/net path
 	conn.batch = scriptedBatch{reads: func([]ipv6.Message) (int, error) { return -1, syscall.ENOSYS }}
 	c.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
 	n, err = conn.Read([]Message{{Payload: make([]byte, 100)}})
