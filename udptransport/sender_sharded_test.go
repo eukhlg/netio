@@ -12,6 +12,14 @@ import (
 	"github.com/eukhlg/netio/flowhash"
 )
 
+func testShards(writers []Writer) []Shard {
+	shards := make([]Shard, len(writers))
+	for i, w := range writers {
+		shards[i] = Shard{Conn: newSenderSocket(), Writer: w}
+	}
+	return shards
+}
+
 // countingOwner checks the ownership contract: one release per accepted datagram.
 type countingOwner struct {
 	released *atomic.Int64
@@ -41,7 +49,7 @@ func TestShardedSenderPreservesPerFlowOrder(t *testing.T) {
 			return len(m), nil
 		})
 	}
-	s, err := NewShardedSender(context.Background(), newSenderSocket(), writers, 8, 16)
+	s, err := NewShardedSender(context.Background(), testShards(writers), 8, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +98,7 @@ func TestShardedSenderOwnershipUnderConcurrency(t *testing.T) {
 			return len(m), nil
 		})
 	}
-	s, err := NewShardedSender(context.Background(), newSenderSocket(), writers, 4, 8)
+	s, err := NewShardedSender(context.Background(), testShards(writers), 4, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +146,7 @@ func TestShardedSenderCloseReleasesQueued(t *testing.T) {
 		senderWriter(func(m []Message) (int, error) { <-block; return len(m), nil }),
 		senderWriter(func(m []Message) (int, error) { <-block; return len(m), nil }),
 	}
-	s, err := NewShardedSender(context.Background(), newSenderSocket(), writers, 4, 4)
+	s, err := NewShardedSender(context.Background(), testShards(writers), 4, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +182,7 @@ func TestShardedSenderFailureStopsAllShards(t *testing.T) {
 		senderWriter(func(m []Message) (int, error) { return 0, failure }),
 		senderWriter(func(m []Message) (int, error) { return len(m), nil }),
 	}
-	s, err := NewShardedSender(context.Background(), newSenderSocket(), writers, 4, 4)
+	s, err := NewShardedSender(context.Background(), testShards(writers), 4, 4)
 	if err != nil {
 		t.Fatal(err)
 	}

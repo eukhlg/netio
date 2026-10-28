@@ -20,27 +20,35 @@ type ShardedSender struct {
 	stopped sync.WaitGroup
 }
 
-// NewShardedSender uses one batch writer per shard. writers[i] keeps its own
-// message metadata and offload state; all of them must write to conn, which
-// the ShardedSender owns and closes. One writer gives exactly Sender behavior.
-func NewShardedSender(ctx context.Context, conn net.PacketConn, writers []Writer, capacity, batchSize int) (*ShardedSender, error) {
-	if len(writers) < 1 {
+// Shard is one sender's descriptor and batch writer. Go serializes writes per
+// descriptor (poll.FD write lock), so shards only send in parallel when each
+// has its own descriptor for the socket (DuplicatePacketConn); Writer must
+// write to Conn and keep its own message metadata and offload state.
+type Shard struct {
+	Conn   net.PacketConn
+	Writer Writer
+}
+
+// NewShardedSender starts one Sender per shard; each owns and closes its Conn.
+// One shard gives exactly Sender behavior.
+func NewShardedSender(ctx context.Context, shards []Shard, capacity, batchSize int) (*ShardedSender, error) {
+	if len(shards) < 1 {
 		return nil, errors.New("udp sender: at least one shard required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &ShardedSender{cancel: cancel}
-	for _, writer := range writers {
-		shard, err := NewSenderWithWriter(ctx, conn, writer, capacity, batchSize)
+	for _, shard := range shards {
+		sender, err := NewSenderWithWriter(ctx, shard.Conn, shard.Writer, capacity, batchSize)
 		if err != nil {
 			s.Close()
 			return nil, err
 		}
-		s.shards = append(s.shards, shard)
+		s.shards = append(s.shards, sender)
 		s.stopped.Add(1)
 		go func() {
 			defer s.stopped.Done()
-			<-shard.stopped
-			cancel() // one failed shard closes the socket; stop the others too
+			<-sender.stopped
+			cancel() // one failed shard stops the others too
 		}()
 	}
 	return s, nil
