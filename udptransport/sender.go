@@ -155,6 +155,11 @@ func (s *Sender) Flush(ctx context.Context) error {
 	}
 }
 func (s *Sender) Close() { s.cancel(); <-s.stopped }
+
+// Done is closed once the sender has stopped, after a write failure, after
+// cancellation or Close, with every queued datagram released. Err then reports
+// why.
+func (s *Sender) Done() <-chan struct{} { return s.stopped }
 func (s *Sender) run() {
 	var failure error
 	defer func() {

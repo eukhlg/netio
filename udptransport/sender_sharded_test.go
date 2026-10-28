@@ -194,7 +194,8 @@ func TestShardedSenderFailureStopsAllShards(t *testing.T) {
 	if err := s.Enqueue(context.Background(), Datagram{Payload: []byte{1}, Flow: failing}); err != nil {
 		t.Fatal(err)
 	}
-	waitSender(t, s.shards[1].stopped)
+	waitSender(t, s.Done())
+	waitSender(t, s.shards[1].Done())
 	if err := s.Err(); !errors.Is(err, failure) {
 		t.Fatalf("Err = %v", err)
 	}
