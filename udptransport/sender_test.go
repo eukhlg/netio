@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -260,7 +261,9 @@ func TestSenderBackpressureCallerCancellation(t *testing.T) {
 	}
 }
 
-func TestSenderCancellationWhileWaitingForSubmitGate(t *testing.T) {
+// A producer with an ended context returns at once, even while another is
+// blocked on the full queue.
+func TestSenderCancellationWhileAnotherProducerBlocks(t *testing.T) {
 	for _, batchSize := range []int{1, 32, 128} {
 		t.Run(fmt.Sprint(batchSize), func(t *testing.T) {
 			socket := newSenderSocket()
@@ -286,10 +289,68 @@ func TestSenderCancellationWhileWaitingForSubmitGate(t *testing.T) {
 					t.Fatal(err)
 				}
 			case <-time.After(time.Second):
-				t.Fatal("context cannot interrupt submit gate")
+				t.Fatal("ended context did not return")
 			}
 			s.Close()
 			<-blocked
 		})
+	}
+}
+
+// Enqueue cost per datagram with an eligibility check, one producer, the
+// sender writing in batches as fast as it can.
+func BenchmarkSenderEnqueue(b *testing.B) {
+	writer := senderWriter(func(m []Message) (int, error) { return len(m), nil })
+	sender, err := NewSenderWithWriter(context.Background(), newSenderSocket(), writer, SenderQueueCapacity, 128)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sender.Close()
+	eligible := func() bool { return true }
+	payload := make([]byte, 1400)
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := sender.Enqueue(ctx, Datagram{Payload: payload, Eligible: eligible}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Producers racing Close: every accepted datagram is released exactly once,
+// rejected ones never, and nothing is queued after the final drain.
+func TestSenderCloseRacingProducersReleasesEachAcceptedOnce(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		var released, accepted atomic.Int64
+		writer := senderWriter(func(m []Message) (int, error) { return len(m), nil })
+		s, err := NewSenderWithWriter(context.Background(), newSenderSocket(), writer, 4, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var producers sync.WaitGroup
+		for p := 0; p < 8; p++ {
+			producers.Add(1)
+			go func() {
+				defer producers.Done()
+				for {
+					owner := &countingOwner{released: &released}
+					if err := s.Enqueue(context.Background(), Datagram{Payload: []byte{1}, Owner: owner}); err != nil {
+						if owner.once.Load() != 0 {
+							t.Error("rejected datagram released")
+						}
+						return
+					}
+					accepted.Add(1)
+				}
+			}()
+		}
+		for accepted.Load() < int64(round) {
+			runtime.Gosched()
+		}
+		s.Close()
+		producers.Wait()
+		if released.Load() != accepted.Load() {
+			t.Fatalf("round %d: released %d of %d accepted", round, released.Load(), accepted.Load())
+		}
 	}
 }

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 const SenderQueueCapacity = 64
@@ -55,13 +57,17 @@ type Sender struct {
 	ctx                     context.Context
 	cancel                  context.CancelFunc
 	queue                   chan queuedDatagram
-	submit                  chan struct{}
 	stopped, watcherStopped chan struct{}
-	mu                      sync.Mutex
-	err                     error
-	batch                   []queuedDatagram
-	messages                []Message
-	indices                 []int
+	// Producers count themselves in inflight while they enqueue; the stopping
+	// sender sets stopping and waits for inflight to reach zero before its
+	// final drain, so no datagram is queued after it (see enqueue).
+	inflight atomic.Int64
+	stopping atomic.Bool
+	mu       sync.Mutex
+	err      error
+	batch    []queuedDatagram
+	messages []Message
+	indices  []int
 }
 
 func NewSender(ctx context.Context, conn net.PacketConn, capacity int, batchSize ...int) (*Sender, error) {
@@ -87,11 +93,10 @@ func NewSenderWithWriter(ctx context.Context, conn net.PacketConn, writer Writer
 		return nil, errors.New("udp sender: connection, writer and positive capacity required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	s := &Sender{conn: conn, writer: writer, ctx: ctx, cancel: cancel, queue: make(chan queuedDatagram, capacity), submit: make(chan struct{}, 1), stopped: make(chan struct{}), watcherStopped: make(chan struct{})}
+	s := &Sender{conn: conn, writer: writer, ctx: ctx, cancel: cancel, queue: make(chan queuedDatagram, capacity), stopped: make(chan struct{}), watcherStopped: make(chan struct{})}
 	s.batch = make([]queuedDatagram, size)
 	s.messages = make([]Message, size)
 	s.indices = make([]int, size)
-	s.submit <- struct{}{}
 	go func() { defer close(s.watcherStopped); <-ctx.Done(); _ = conn.Close() }()
 	go s.run()
 	return s, nil
@@ -104,26 +109,31 @@ func (s *Sender) Err() error {
 	}
 	return s.ctx.Err()
 }
+
+// enqueue accepts q unless the sender is stopping, ctx has ended or q is no
+// longer eligible. Atomic loads and a non-blocking send make the common case;
+// only a full queue waits, and that wait ends with ctx or the sender.
+//
+// Shutdown: a producer increments inflight before it loads stopping, and the
+// sender stores stopping before it waits for inflight to reach zero. These
+// are sequentially consistent, so either the producer sees stopping and queues
+// nothing, or the sender waits for it and drains what it queued.
 func (s *Sender) enqueue(ctx context.Context, q queuedDatagram) error {
-	if err := s.Err(); err != nil {
-		return err
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.ctx.Done():
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+	if s.stopping.Load() || s.ctx.Err() != nil {
 		return s.Err()
-	case <-s.submit:
-	}
-	defer func() { s.submit <- struct{}{} }()
-	if err := s.Err(); err != nil {
-		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if q.datagram.Eligible != nil && !q.datagram.Eligible() {
 		return ErrIneligible
+	}
+	select {
+	case s.queue <- q:
+		return nil
+	default:
 	}
 	select {
 	case <-ctx.Done():
@@ -168,14 +178,16 @@ func (s *Sender) run() {
 			s.err = failure
 			s.mu.Unlock()
 		}
-		s.cancel()
+		s.stopping.Store(true)
+		s.cancel() // wakes producers waiting on a full queue
 		<-s.watcherStopped
-		<-s.submit
+		for s.inflight.Load() != 0 {
+			runtime.Gosched()
+		}
 		for len(s.queue) > 0 {
 			q := <-s.queue
 			q.datagram.release()
 		}
-		s.submit <- struct{}{}
 		close(s.stopped)
 	}()
 	batch, messages, indices := s.batch, s.messages, s.indices
