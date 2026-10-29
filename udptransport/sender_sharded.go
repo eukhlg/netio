@@ -18,6 +18,7 @@ type ShardedSender struct {
 	shards  []*Sender
 	cancel  context.CancelFunc
 	stopped sync.WaitGroup
+	done    chan struct{}
 }
 
 // Shard is one sender's descriptor and batch writer. Go serializes writes per
@@ -36,7 +37,7 @@ func NewShardedSender(ctx context.Context, shards []Shard, capacity, batchSize i
 		return nil, errors.New("udp sender: at least one shard required")
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	s := &ShardedSender{cancel: cancel}
+	s := &ShardedSender{cancel: cancel, done: make(chan struct{})}
 	for _, shard := range shards {
 		sender, err := NewSenderWithWriter(ctx, shard.Conn, shard.Writer, capacity, batchSize)
 		if err != nil {
@@ -51,8 +52,12 @@ func NewShardedSender(ctx context.Context, shards []Shard, capacity, batchSize i
 			cancel() // one failed shard stops the others too
 		}()
 	}
+	go func() { s.stopped.Wait(); close(s.done) }()
 	return s, nil
 }
+
+// Done is closed once every shard has stopped (a failure of one stops all).
+func (s *ShardedSender) Done() <-chan struct{} { return s.done }
 
 // Shards reports the number of independent senders.
 func (s *ShardedSender) Shards() int { return len(s.shards) }

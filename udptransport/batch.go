@@ -28,7 +28,8 @@ func ValidateBatchSize(size int) error {
 }
 
 // Message borrows caller-owned storage until the operation returns. N and
-// Truncated are receive outputs. Each message is one UDP datagram.
+// Truncated are receive outputs. Each message is one UDP datagram. A received
+// Peer may be shared with other messages from the same address: read-only.
 type Message struct {
 	Payload   []byte
 	Peer      net.Addr
@@ -58,6 +59,9 @@ type Conn struct {
 	groOOB                        [][]byte
 	groCount, groIndex, groOffset int
 	groErr                        error
+	// recv, on Linux without GRO, reads with recvmmsg and cached peer
+	// addresses instead of x/net.
+	recv *receiver
 }
 
 func New(conn net.PacketConn) *Conn {
@@ -98,6 +102,9 @@ func NewWithOptions(conn net.PacketConn, size int, options Options) (*Conn, erro
 	}
 	c.gso.Store(!options.DisableGSO && probeGSO(conn))
 	c.gro = options.EnableGRO && enableGRO(conn)
+	if !c.gro && c.batch != nil {
+		c.recv = newReceiver(conn, size)
+	}
 	if c.gro {
 		c.groBuffers = make([][]byte, size)
 		c.groOOB = make([][]byte, size)
@@ -136,6 +143,16 @@ func (c *Conn) Read(messages []Message) (int, error) {
 	}
 	if c.gro {
 		return c.readGRO(messages)
+	}
+	if c.recv != nil && !c.readFallback.Load() {
+		n, err := c.recv.read(messages)
+		if n != 0 || !unsupported(err) {
+			if n == 0 && err == nil {
+				err = io.ErrNoProgress
+			}
+			return n, err
+		}
+		c.readFallback.Store(true)
 	}
 	if c.batch != nil && !c.readFallback.Load() {
 		for i := range messages {
